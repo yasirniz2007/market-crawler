@@ -9,10 +9,8 @@ import time
 import streamlit as st
 import streamlit.components.v1 as components
 
+import report_crawler
 import universal_market_analyzer as uma
-import market_report as mr
-import news_calendar as nc
-import report_crawler as rc
 
 st.set_page_config(page_title="Market Crawler", page_icon="🕷️", layout="centered")
 
@@ -109,22 +107,14 @@ def draw_map(slot, cur, prev, visited, label):
 
 
 # ---------------- UI ----------------
-st.title("🕷️ Market Crawler")
-st.caption("A spider crawls prices and news, scores sentiment, and estimates probabilities. Not financial advice.")
+tab1, tab2 = st.tabs(["📈 Market crawler", "📄 Report crawler"])
+with tab2:
+    report_crawler.render()
 
-tab_any, tab_news, tab_rep, tab_mkt = st.tabs(
-    ["🌐 Any market", "🗞️ News & calendar", "📄 SEC reports", "📈 Probability map"])
+with tab1:
+    st.title("🕷️ Market Crawler")
+    st.caption("A spider crawls prices and news, scores sentiment, and estimates probabilities. Not financial advice.")
 
-with tab_any:
-    mr.render()
-
-with tab_news:
-    nc.render()
-
-with tab_rep:
-    rc.render()
-
-with tab_mkt:
     assets = st.text_input("Assets (comma separated)", "bitcoin, AAPL, gold, eurusd",
                            help="Tickers or names: AAPL, 7203.T, bitcoin, gold, eurusd, nasdaq")
     with st.expander("Settings"):
@@ -135,6 +125,45 @@ with tab_mkt:
         region = c2.text_input("News region", "US")
 
     go = st.button("🚀 Start crawling", use_container_width=True, type="primary")
+    scan_all = st.button("🌍 Scan all 28 forex pairs", use_container_width=True, key="scan_all")
+
+    def show_scan(sc):
+        import pandas as pd
+        ok = sorted([r for r in sc["rows"] if "error" not in r], key=lambda r: -r["p_up"])
+        st.markdown("### 🌍 All forex pairs")
+        if not ok:
+            st.error("No pair could be read. Try again in a minute.")
+            return
+        st.caption(f"Ranked by chance of an up move over {sc['horizon']} day(s). "
+                   "Up means the first currency strengthens against the second. Not financial advice.")
+        t1, t2 = st.columns(2)
+        t1.markdown("**Most bullish**<br>" + "<br>".join(f"{r['pair']} {r['p_up']:.0%}" for r in ok[:3]),
+                    unsafe_allow_html=True)
+        t2.markdown("**Most bearish**<br>" + "<br>".join(f"{r['pair']} {r['p_up']:.0%}" for r in ok[-3:][::-1]),
+                    unsafe_allow_html=True)
+        df = pd.DataFrame([{"Pair": r["pair"], "Price": r["price"], "P(up) %": round(r["p_up"] * 100, 1),
+                            "View": r["verdict"], "Vol/day %": round(r["vol"], 2),
+                            "Base news": round(r["s_base"], 2), "Quote news": round(r["s_quote"], 2)}
+                           for r in ok])
+        st.dataframe(df, hide_index=True, use_container_width=True, column_config={
+            "P(up) %": st.column_config.ProgressColumn("P(up)", min_value=0, max_value=100, format="%.0f%%")})
+        st.markdown("**Currency strength from news**")
+        st.bar_chart(pd.DataFrame({"news strength": sc["strength"]}), height=200)
+        bad = [r["pair"] for r in sc["rows"] if "error" in r]
+        if bad:
+            st.caption("No data for: " + ", ".join(bad))
+
+    if scan_all:
+        bar_s = st.progress(0.0, text="Scanning forex pairs…")
+
+        def prog(i, n, p):
+            bar_s.progress(i / n, text=f"Scanning {p} ({i}/{n})")
+
+        st.session_state["fx_scan"] = uma.scan_pairs(uma.Http(delay=1.0), uma.ALL_PAIRS, days, horizon,
+                                                     region, "en", progress=prog)
+        bar_s.empty()
+    if st.session_state.get("fx_scan"):
+        show_scan(st.session_state["fx_scan"])
 
 
     def verdict_color(v):
@@ -164,15 +193,21 @@ with tab_mkt:
             step("Not enough price data (check symbol or retry in a minute)", 1, state["prev"])
             return None
         step(f"Got {len(closes)} daily closes for {meta.get('name', sym)}", 0.45, 1)
-        step("Crawling Yahoo Finance news", 0.55, 2)
-        q = raw if uma.asset_type(sym) == "forex" else meta.get("name", raw)
-        items = uma.get_news(http, sym, q, region, "en", news_n)
-        step(f"Crawling Google News, {len(items)} unique headlines", 0.7, 3)
-        s, conf = uma.news_score(items)
+        is_fx = uma.asset_type(sym) == "forex"
+        cur_a, cur_b = uma.pair_currencies(sym) if is_fx else (None, None)
+        if is_fx and cur_a:
+            step(f"Crawling {cur_a} and {cur_b} central-bank news", 0.55, 2)
+        else:
+            step("Crawling Yahoo Finance news", 0.55, 2)
+        items, s, conf, fx = uma.gather_news(http, sym, raw, meta, region, "en", news_n)
+        if fx:
+            step(f"Currency strength: {fx['base']} {fx['s_base']:+.2f} vs {fx['quote']} {fx['s_quote']:+.2f}", 0.7, 3)
+        else:
+            step(f"Crawling Google News, {len(items)} unique headlines", 0.7, 3)
         step("Scoring headline sentiment", 0.85, 4)
-        res = uma.model(closes, s, conf, horizon)
+        res = uma.model(closes, s, conf, horizon, thr_daily=0.005 if fx else 0.02)
         step("Computing probabilities", 0.95, 5)
-        res.update({"symbol": sym, "type": uma.asset_type(sym), **meta, "news_sentiment": s,
+        res.update({"symbol": sym, "type": uma.asset_type(sym), **meta, "fx": fx, "news_sentiment": s,
                     "news_confidence": conf, "verdict": uma.verdict(res["p_up"])})
         step("Done: result ready", 1.0, 6)
         return res, closes, items
@@ -196,13 +231,23 @@ with tab_mkt:
         st.caption(f"Likely range (68%): {res['range_68pct'][0]:+.2f}% to {res['range_68pct'][1]:+.2f}% · "
                    f"news {res['news_sentiment']:+.2f} (confidence {res['news_confidence']:.0%}) · "
                    f"momentum {res['momentum']:+.2f} · base rate {res['base_rate']:.0%}")
+        fx = res.get("fx")
+        if fx:
+            st.markdown("**Currency strength from news**")
+            f1, f2, f3 = st.columns(3)
+            f1.metric(fx["base"], f"{fx['s_base']:+.2f}", f"{fx['n_base']} headlines", delta_color="off")
+            f2.metric(fx["quote"], f"{fx['s_quote']:+.2f}", f"{fx['n_quote']} headlines", delta_color="off")
+            f3.metric("Pair view", f"{fx['s_direct']:+.2f}", f"{fx['n_direct']} headlines", delta_color="off")
+            st.caption(f"Up move means {fx['base']} strengthens against {fx['quote']}. "
+                       f"Pair score = {fx['base']} news minus {fx['quote']} news.")
         st.line_chart(closes, height=180)
         if items:
             with st.expander(f"Headlines crawled ({len(items)})"):
                 for it in items:
-                    sc = uma.sentiment(it["title"])
+                    sc = uma.sentiment(it["title"], bool(fx))
                     dot = "🟢" if sc > 0.15 else "🔴" if sc < -0.15 else "⚪"
-                    st.markdown(f"{dot} `{sc:+.2f}` [{it['title']}]({it.get('link') or ''}) · _{it['source']}_")
+                    tag = f"**{it['tag']}** " if it.get("tag") else ""
+                    st.markdown(f"{dot} `{sc:+.2f}` {tag}[{it['title']}]({it.get('link') or ''}) · _{it['source']}_")
 
 
     if go:

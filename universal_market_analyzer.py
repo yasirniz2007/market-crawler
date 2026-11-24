@@ -23,13 +23,11 @@ import urllib.robotparser as robotparser
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from urllib.parse import quote, quote_plus, urlparse
+from urllib.parse import quote_plus, urlparse
 
 import requests
 
 UA = "UniversalMarketAnalyzer/1.0 (educational; contact: you@example.com)"
-BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
-              "Chrome/124.0 Safari/537.36")
 
 # ---------- friendly name -> Yahoo symbol ----------
 ALIASES = {
@@ -37,6 +35,7 @@ ALIASES = {
     "solana": "SOL-USD", "xrp": "XRP-USD", "dogecoin": "DOGE-USD", "bnb": "BNB-USD",
     "gold": "GC=F", "silver": "SI=F", "oil": "CL=F", "crude": "CL=F", "brent": "BZ=F",
     "gas": "NG=F", "copper": "HG=F",
+    "xauusd": "GC=F", "xau": "GC=F", "xagusd": "SI=F",
     "sp500": "^GSPC", "s&p500": "^GSPC", "nasdaq": "^IXIC", "dow": "^DJI",
     "dax": "^GDAXI", "nikkei": "^N225", "ftse": "^FTSE", "nifty": "^NSEI", "vix": "^VIX",
 }
@@ -67,10 +66,8 @@ def asset_type(sym):
 class Http:
     def __init__(self, delay=1.2):
         self.s = requests.Session()
-        self.s.headers.update({"User-Agent": BROWSER_UA, "Accept": "application/json,text/plain,*/*",
-                               "Accept-Language": "en-US,en;q=0.9"})
+        self.s.headers["User-Agent"] = UA
         self.delay, self._last, self._rp = delay, 0.0, {}
-        self.notes, self.last_error = [], ""          # why data sources failed (shown in the app)
 
     def _ok(self, url):
         host = "{0.scheme}://{0.netloc}".format(urlparse(url))
@@ -93,108 +90,27 @@ class Http:
                 r = self.s.get(url, timeout=15, **kw)
                 self._last = time.time()
                 if r.status_code == 429:
-                    self.last_error = "HTTP 429 (rate limited)"
                     time.sleep(5 * i); continue
                 r.raise_for_status()
-                self.last_error = ""
                 return r
-            except requests.RequestException as e:
-                resp = getattr(e, "response", None)
-                self.last_error = f"HTTP {resp.status_code}" if resp is not None else type(e).__name__
+            except requests.RequestException:
                 time.sleep(2 * i)
         return None
 
 
 # ---------- data ----------
-def _yahoo_prices(http, sym, days):
-    rng = "6mo" if days <= 180 else "2y"
-    for host in ("query1", "query2"):
-        r = http.get(f"https://{host}.finance.yahoo.com/v8/finance/chart/{sym}", retries=2,
-                     params={"range": rng, "interval": "1d"})
-        if r is None:
-            http.notes.append(f"Yahoo {host}: {http.last_error or 'no reply'}")
-            continue
-        try:
-            res = r.json()["chart"]["result"][0]
-            closes = [c for c in res["indicators"]["quote"][0]["close"] if c is not None][-days:]
-            m = res["meta"]
-            return closes, {"name": m.get("longName") or m.get("shortName") or sym,
-                            "currency": m.get("currency"), "price": m.get("regularMarketPrice"),
-                            "source": "Yahoo Finance"}
-        except Exception:
-            http.notes.append(f"Yahoo {host}: unexpected reply")
-    return [], {}
-
-
-STOOQ = {"GC=F": "xauusd", "SI=F": "xagusd", "CL=F": "cl.f", "NG=F": "ng.f", "HG=F": "hg.f",
-         "^GSPC": "^spx", "^DJI": "^dji", "^GDAXI": "^dax", "^N225": "^nkx", "^FTSE": "^ukx", "^VIX": "^vix"}
-COINGECKO = {"BTC-USD": "bitcoin", "ETH-USD": "ethereum", "SOL-USD": "solana", "XRP-USD": "ripple",
-             "DOGE-USD": "dogecoin", "BNB-USD": "binancecoin"}
-
-
-def _stooq_code(sym):
-    if sym in STOOQ:
-        return STOOQ[sym]
-    if sym.endswith("=X"):
-        return sym[:-2].lower()                       # EURUSD=X -> eurusd
-    if re.fullmatch(r"[A-Z]{1,5}", sym):
-        return sym.lower() + ".us"                    # AAPL -> aapl.us
-    return None
-
-
-def _stooq_prices(http, sym, days):
-    code = _stooq_code(sym)
-    if not code:
-        return [], {}
-    r = http.get(f"https://stooq.com/q/d/l/?s={quote(code, safe='^.')}&i=d", retries=2)
-    if r is None:
-        http.notes.append(f"Stooq: {http.last_error or 'no reply'}")
-        return [], {}
-    rows = r.text.strip().splitlines()
-    if len(rows) < 3 or not rows[0].lower().startswith("date"):
-        http.notes.append("Stooq: unexpected reply")
-        return [], {}
-    closes = []
-    for ln in rows[1:]:
-        p = ln.split(",")
-        try:
-            closes.append(float(p[4]))
-        except (ValueError, IndexError):
-            pass
-    closes = closes[-days:]
-    if not closes:
-        return [], {}
-    return closes, {"name": sym, "currency": "", "price": closes[-1], "source": "Stooq"}
-
-
-def _coingecko_prices(http, sym, days):
-    cid = COINGECKO.get(sym)
-    if not cid:
-        return [], {}
-    r = http.get(f"https://api.coingecko.com/api/v3/coins/{cid}/market_chart", retries=2,
-                 params={"vs_currency": "usd", "days": days, "interval": "daily"})
-    if r is None:
-        http.notes.append(f"CoinGecko: {http.last_error or 'no reply'}")
-        return [], {}
-    try:
-        closes = [p[1] for p in r.json()["prices"] if p[1] is not None][-days:]
-    except Exception:
-        http.notes.append("CoinGecko: unexpected reply")
-        return [], {}
-    if not closes:
-        return [], {}
-    return closes, {"name": cid.title(), "currency": "USD", "price": closes[-1], "source": "CoinGecko"}
-
-
 def get_prices(http, sym, days):
-    closes, meta = _yahoo_prices(http, sym, days)
-    if len(closes) >= 10:
-        return closes, meta
-    for fn in (_stooq_prices, _coingecko_prices):      # backups when Yahoo blocks cloud servers
-        closes, meta = fn(http, sym, days)
-        if len(closes) >= 10:
-            return closes, meta
-    return [], {}
+    rng = "6mo" if days <= 180 else "2y"
+    r = http.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}",
+                 params={"range": rng, "interval": "1d"})
+    try:
+        res = r.json()["chart"]["result"][0]
+        closes = [c for c in res["indicators"]["quote"][0]["close"] if c is not None][-days:]
+        m = res["meta"]
+        return closes, {"name": m.get("longName") or m.get("shortName") or sym,
+                        "currency": m.get("currency"), "price": m.get("regularMarketPrice")}
+    except Exception:
+        return [], {}
 
 
 def _rss(http, url, tag, sym):
@@ -235,17 +151,25 @@ NEG = {"miss", "misses", "plunge", "plunges", "fall", "falls", "drop", "drops", 
 NOT = {"not", "no", "never", "without", "fails", "failed", "despite"}
 
 
-def sentiment(text):
+FX_POS = (POS - {"easing"}) | {"hawkish", "hike", "hikes", "hiking", "tightening", "strengthens",
+                              "strengthen", "firmer", "stronger", "resilient", "upbeat", "hotter"}
+FX_NEG = NEG | {"dovish", "easing", "weakens", "weaken", "weaker", "softer", "slides", "slide", "tumbles",
+                "tumble", "dips", "dip", "stimulus", "contraction", "stagnation", "pessimism"}
+
+
+def sentiment(text, fx=False):
+    """Headline score in [-1, 1]. fx=True uses central-bank / currency wording."""
+    pos_set, neg_set = (FX_POS, FX_NEG) if fx else (POS, NEG)
     w = re.findall(r"[a-z']+", text.lower())
     p = n = 0.0
     for i, x in enumerate(w):
         flip = any(y in NOT for y in w[max(0, i - 2):i])
-        if x in POS: p, n = (p, n + 1) if flip else (p + 1, n)
-        elif x in NEG: p, n = (p + 1, n) if flip else (p, n + 1)
+        if x in pos_set: p, n = (p, n + 1) if flip else (p + 1, n)
+        elif x in neg_set: p, n = (p + 1, n) if flip else (p, n + 1)
     return (p - n) / (p + n + 1)
 
 
-def news_score(items, half_life_h=24.0):
+def news_score(items, half_life_h=24.0, fx=False):
     now, num, den = datetime.now(timezone.utc), 0.0, 0.0
     for it in items:
         try:
@@ -253,7 +177,7 @@ def news_score(items, half_life_h=24.0):
         except Exception:
             age = 24
         w = 0.5 ** (age / half_life_h)
-        num += w * sentiment(it["title"]); den += w
+        num += w * sentiment(it["title"], fx); den += w
     return (num / den if den else 0.0), 1 - math.exp(-den)
 
 
@@ -262,7 +186,7 @@ phi = lambda x: 0.5 * (1 + math.erf(x / math.sqrt(2)))
 sigmoid = lambda x: 1 / (1 + math.exp(-x))
 
 
-def model(closes, s, conf, horizon, w_news=1.5, w_mom=0.6):
+def model(closes, s, conf, horizon, w_news=1.5, w_mom=0.6, thr_daily=0.02):
     r = [closes[i] / closes[i - 1] - 1 for i in range(1, len(closes))]
     n = len(r)
     mu = sum(r) / n
@@ -273,7 +197,7 @@ def model(closes, s, conf, horizon, w_news=1.5, w_mom=0.6):
     p_up = sigmoid(math.log(prior / (1 - prior)) + w_mom * mom + w_news * conf * s)
     mu_h = (mu + 0.25 * sd * conf * s) * horizon              # drift over horizon
     sd_h = sd * math.sqrt(horizon)                            # volatility scales with sqrt(time)
-    thr = 0.02 * math.sqrt(horizon)
+    thr = thr_daily * math.sqrt(horizon)
     return {
         "p_up": p_up, "base_rate": prior, "momentum": mom, "daily_vol_pct": sd * 100,
         "horizon_days": horizon,
@@ -289,20 +213,119 @@ def verdict(p):
             else "SLIGHTLY BEARISH" if p > .38 else "BEARISH")
 
 
+# ---------- forex: currency-by-currency news ----------
+CUR_QUERY = {
+    "USD": "US dollar Federal Reserve", "EUR": "euro ECB eurozone", "GBP": "pound sterling Bank of England",
+    "JPY": "Japanese yen Bank of Japan", "CHF": "Swiss franc SNB", "AUD": "Australian dollar RBA",
+    "CAD": "Canadian dollar Bank of Canada", "NZD": "New Zealand dollar RBNZ", "INR": "Indian rupee RBI",
+    "CNY": "Chinese yuan PBOC", "TRY": "Turkish lira", "BRL": "Brazilian real", "MXN": "Mexican peso",
+    "ZAR": "South African rand", "SGD": "Singapore dollar MAS",
+}
+
+
+def pair_currencies(sym):
+    c = sym.replace("=X", "")
+    if len(c) == 6:
+        return c[:3], c[3:]
+    if len(c) == 3:
+        return "USD", c
+    return None, None
+
+
+def _google(http, query, region, lang, tag, limit):
+    q = quote_plus(query + " when:3d")
+    items = _rss(http, f"https://news.google.com/rss/search?q={q}&hl={lang}-{region}"
+                       f"&gl={region}&ceid={region}:{lang}", "google", tag)
+    seen, out = set(), []
+    for it in items:
+        k = re.sub(r"\W+", "", it["title"].lower())[:60]
+        if k and k not in seen:
+            seen.add(k); it["tag"] = tag; out.append(it)
+    return out[:limit]
+
+
+def gather_news(http, sym, raw, meta, region, lang, limit):
+    """Returns (items, news_score, confidence, fx_info_or_None)."""
+    if asset_type(sym) != "forex":
+        items = get_news(http, sym, meta.get("name", raw), region, lang, limit)
+        for it in items:
+            it["tag"] = ""
+        s, conf = news_score(items)
+        return items, s, conf, None
+    base, quote = pair_currencies(sym)
+    if not base:
+        items = get_news(http, sym, raw, region, lang, limit)
+        s, conf = news_score(items, fx=True)
+        return items, s, conf, None
+    per = max(6, limit // 2)
+    bi = _google(http, CUR_QUERY.get(base, base + " currency"), region, lang, base, per)
+    qi = _google(http, CUR_QUERY.get(quote, quote + " currency"), region, lang, quote, per)
+    di = _google(http, f"{base}/{quote} forex forecast", region, lang, "PAIR", per)
+    sb, cb = news_score(bi, fx=True)
+    sq, cq = news_score(qi, fx=True)
+    sd, cd = news_score(di, fx=True)
+    s_cur = max(-1.0, min(1.0, sb - sq))        # base strength minus quote strength
+    if di:
+        s, conf = 0.6 * s_cur + 0.4 * sd, (cb + cq + cd) / 3
+    else:
+        s, conf = s_cur, (cb + cq) / 2
+    info = {"base": base, "quote": quote, "s_base": sb, "s_quote": sq, "s_direct": sd,
+            "n_base": len(bi), "n_quote": len(qi), "n_direct": len(di)}
+    return bi + qi + di, s, conf, info
+
+
+# ---------- scan every forex pair ----------
+MAJORS = ["EURUSD", "GBPUSD", "USDJPY", "USDCHF", "AUDUSD", "USDCAD", "NZDUSD"]
+CROSSES = ["EURGBP", "EURJPY", "EURCHF", "EURAUD", "EURCAD", "EURNZD", "GBPJPY", "GBPCHF", "GBPAUD",
+           "GBPCAD", "GBPNZD", "AUDJPY", "AUDCHF", "AUDCAD", "AUDNZD", "CADJPY", "CADCHF", "NZDJPY",
+           "NZDCHF", "NZDCAD", "CHFJPY"]
+ALL_PAIRS = MAJORS + CROSSES          # 28 pairs from the 8 main currencies
+
+
+def scan_pairs(http, pairs, days, horizon, region, lang, per_cur=10, progress=None):
+    """Fast scan: news is fetched once per currency, prices once per pair."""
+    cache = {}
+
+    def cur_score(c):
+        if c not in cache:
+            items = _google(http, CUR_QUERY.get(c, c + " currency"), region, lang, c, per_cur)
+            cache[c] = news_score(items, fx=True)
+        return cache[c]
+
+    rows = []
+    for i, p in enumerate(pairs):
+        sym = resolve(p)
+        closes, meta = get_prices(http, sym, days)
+        b, q = pair_currencies(sym)
+        if len(closes) < 10 or not b:
+            rows.append({"pair": p, "error": "no price data"})
+        else:
+            sb, cb = cur_score(b)
+            sq, cq = cur_score(q)
+            s, conf = max(-1.0, min(1.0, sb - sq)), (cb + cq) / 2
+            r = model(closes, s, conf, horizon, thr_daily=0.005)
+            rows.append({"pair": f"{b}/{q}", "symbol": sym, "price": meta.get("price"),
+                         "p_up": r["p_up"], "verdict": verdict(r["p_up"]), "vol": r["daily_vol_pct"],
+                         "base": b, "quote": q, "s_base": sb, "s_quote": sq,
+                         "range": r["range_68pct"]})
+        if progress:
+            progress(i + 1, len(pairs), p)
+    strength = {c: v[0] for c, v in cache.items()}
+    return {"rows": rows, "strength": strength, "horizon": horizon}
+
+
 # ---------- main ----------
 def analyze(http, raw, a):
     sym = resolve(raw)
     closes, meta = get_prices(http, sym, a.days)
     if len(closes) < 10:
         return {"input": raw, "symbol": sym, "error": "not enough price data (check the symbol)"}
-    items = get_news(http, sym, meta.get("name", raw) if asset_type(sym) != "forex" else raw,
-                     a.region, a.lang, a.news)
-    s, conf = news_score(items)
-    res = model(closes, s, conf, a.horizon)
-    res.update({"input": raw, "symbol": sym, "type": asset_type(sym), **meta,
+    items, s, conf, fx = gather_news(http, sym, raw, meta, a.region, a.lang, a.news)
+    res = model(closes, s, conf, a.horizon, thr_daily=0.005 if fx else 0.02)
+    res.update({"input": raw, "symbol": sym, "type": asset_type(sym), **meta, "fx": fx,
                 "news_sentiment": s, "news_confidence": conf, "headlines": len(items),
                 "verdict": verdict(res["p_up"]),
-                "top_headlines": [{"title": i["title"], "score": round(sentiment(i["title"]), 2),
+                "top_headlines": [{"title": i["title"], "score": round(sentiment(i["title"], fx is not None), 2),
                                    "source": i["source"]} for i in items[:3]]})
     return res
 
@@ -332,6 +355,10 @@ def main():
         print(f"Likely range (68%):   {r['range_68pct'][0]:+.2f}% to {r['range_68pct'][1]:+.2f}%")
         print(f"News: {r['news_sentiment']:+.2f} (conf {r['news_confidence']:.0%}, {r['headlines']} headlines)"
               f" | momentum {r['momentum']:+.2f} | vol {r['daily_vol_pct']:.2f}%/day")
+        if r.get("fx"):
+            f = r["fx"]
+            print(f"Currency news: {f['base']} {f['s_base']:+.2f} ({f['n_base']}) vs "
+                  f"{f['quote']} {f['s_quote']:+.2f} ({f['n_quote']}) | pair headlines {f['s_direct']:+.2f} ({f['n_direct']})")
         for h in r["top_headlines"]:
             print(f"   [{h['score']:+.2f}] {h['title']}")
 
