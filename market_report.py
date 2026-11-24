@@ -40,6 +40,7 @@ def _pct(x):
 
 def build_market_payload(raw, sym, kind, closes, meta, items, res, s, horizon):
     name = meta.get("name") or sym
+    src = meta.get("source", "Yahoo Finance")
     cur = meta.get("currency") or ""
     last = closes[-1]
     price = meta.get("price") or last
@@ -67,7 +68,7 @@ def build_market_payload(raw, sym, kind, closes, meta, items, res, s, horizon):
 
     txt("MARKET SNAPSHOT", "hdr")
     txt(f"{name} ({sym})")
-    txt(f"Asset type: {kind}. Source: Yahoo Finance daily closes, {len(closes)} sessions.")
+    txt(f"Asset type: {kind}. Source: {src} daily closes, {len(closes)} sessions.")
     txt("PRICE", "hdr")
     fig("last", f"Last price ({cur or 'quote'})", _num(price))
     fig("d1", "Change over 1 day", _pct(d1))
@@ -86,7 +87,8 @@ def build_market_payload(raw, sym, kind, closes, meta, items, res, s, horizon):
     fig("pup", f"Chance of up move ({horizon}d)", f"{res['p_up']:.0%}")
     txt(f"Verdict: {uma.verdict(res['p_up'])}. Rough statistical estimate, not advice.")
 
-    def row(key, label, section, cur_v, prior="", note="live · Yahoo Finance"):
+    def row(key, label, section, cur_v, prior="", note=None):
+        note = note or f"live · {src}"
         return {"key": key, "label": label, "section": section, "found": True,
                 "cur": cur_v, "prior": prior, "note": note}
 
@@ -146,11 +148,12 @@ def render():
             with st.status("Crawling…", expanded=True) as status:
                 http = uma.Http()
                 st.write(f"▸ Resolving {raw} → {sym} ({kind})")
-                st.write("▸ Crawling Yahoo Finance price history")
+                st.write("▸ Crawling live price history (Yahoo, with backup sources)")
                 closes, meta = uma.get_prices(http, sym, days)
                 if len(closes) < 10:
-                    raise RuntimeError("Not enough price data. Check the symbol or retry in a minute.")
-                st.write(f"▸ Got {len(closes)} daily closes")
+                    why = " | ".join(http.notes[-4:]) or "no reason reported"
+                    raise RuntimeError("Not enough price data. Tried Yahoo and backup sources. " + why)
+                st.write(f"▸ Got {len(closes)} daily closes from {meta.get('source', 'Yahoo Finance')}")
                 st.write("▸ Crawling news headlines")
                 q = raw if kind == "forex" else meta.get("name", raw)
                 items = uma.get_news(http, sym, q, region, "en", news_n)

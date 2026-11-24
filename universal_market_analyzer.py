@@ -23,11 +23,13 @@ import urllib.robotparser as robotparser
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from urllib.parse import quote_plus, urlparse
+from urllib.parse import quote, quote_plus, urlparse
 
 import requests
 
 UA = "UniversalMarketAnalyzer/1.0 (educational; contact: you@example.com)"
+BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/124.0 Safari/537.36")
 
 # ---------- friendly name -> Yahoo symbol ----------
 ALIASES = {
@@ -65,8 +67,10 @@ def asset_type(sym):
 class Http:
     def __init__(self, delay=1.2):
         self.s = requests.Session()
-        self.s.headers["User-Agent"] = UA
+        self.s.headers.update({"User-Agent": BROWSER_UA, "Accept": "application/json,text/plain,*/*",
+                               "Accept-Language": "en-US,en;q=0.9"})
         self.delay, self._last, self._rp = delay, 0.0, {}
+        self.notes, self.last_error = [], ""          # why data sources failed (shown in the app)
 
     def _ok(self, url):
         host = "{0.scheme}://{0.netloc}".format(urlparse(url))
@@ -89,27 +93,108 @@ class Http:
                 r = self.s.get(url, timeout=15, **kw)
                 self._last = time.time()
                 if r.status_code == 429:
+                    self.last_error = "HTTP 429 (rate limited)"
                     time.sleep(5 * i); continue
                 r.raise_for_status()
+                self.last_error = ""
                 return r
-            except requests.RequestException:
+            except requests.RequestException as e:
+                resp = getattr(e, "response", None)
+                self.last_error = f"HTTP {resp.status_code}" if resp is not None else type(e).__name__
                 time.sleep(2 * i)
         return None
 
 
 # ---------- data ----------
-def get_prices(http, sym, days):
+def _yahoo_prices(http, sym, days):
     rng = "6mo" if days <= 180 else "2y"
-    r = http.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}",
-                 params={"range": rng, "interval": "1d"})
-    try:
-        res = r.json()["chart"]["result"][0]
-        closes = [c for c in res["indicators"]["quote"][0]["close"] if c is not None][-days:]
-        m = res["meta"]
-        return closes, {"name": m.get("longName") or m.get("shortName") or sym,
-                        "currency": m.get("currency"), "price": m.get("regularMarketPrice")}
-    except Exception:
+    for host in ("query1", "query2"):
+        r = http.get(f"https://{host}.finance.yahoo.com/v8/finance/chart/{sym}", retries=2,
+                     params={"range": rng, "interval": "1d"})
+        if r is None:
+            http.notes.append(f"Yahoo {host}: {http.last_error or 'no reply'}")
+            continue
+        try:
+            res = r.json()["chart"]["result"][0]
+            closes = [c for c in res["indicators"]["quote"][0]["close"] if c is not None][-days:]
+            m = res["meta"]
+            return closes, {"name": m.get("longName") or m.get("shortName") or sym,
+                            "currency": m.get("currency"), "price": m.get("regularMarketPrice"),
+                            "source": "Yahoo Finance"}
+        except Exception:
+            http.notes.append(f"Yahoo {host}: unexpected reply")
+    return [], {}
+
+
+STOOQ = {"GC=F": "xauusd", "SI=F": "xagusd", "CL=F": "cl.f", "NG=F": "ng.f", "HG=F": "hg.f",
+         "^GSPC": "^spx", "^DJI": "^dji", "^GDAXI": "^dax", "^N225": "^nkx", "^FTSE": "^ukx", "^VIX": "^vix"}
+COINGECKO = {"BTC-USD": "bitcoin", "ETH-USD": "ethereum", "SOL-USD": "solana", "XRP-USD": "ripple",
+             "DOGE-USD": "dogecoin", "BNB-USD": "binancecoin"}
+
+
+def _stooq_code(sym):
+    if sym in STOOQ:
+        return STOOQ[sym]
+    if sym.endswith("=X"):
+        return sym[:-2].lower()                       # EURUSD=X -> eurusd
+    if re.fullmatch(r"[A-Z]{1,5}", sym):
+        return sym.lower() + ".us"                    # AAPL -> aapl.us
+    return None
+
+
+def _stooq_prices(http, sym, days):
+    code = _stooq_code(sym)
+    if not code:
         return [], {}
+    r = http.get(f"https://stooq.com/q/d/l/?s={quote(code, safe='^.')}&i=d", retries=2)
+    if r is None:
+        http.notes.append(f"Stooq: {http.last_error or 'no reply'}")
+        return [], {}
+    rows = r.text.strip().splitlines()
+    if len(rows) < 3 or not rows[0].lower().startswith("date"):
+        http.notes.append("Stooq: unexpected reply")
+        return [], {}
+    closes = []
+    for ln in rows[1:]:
+        p = ln.split(",")
+        try:
+            closes.append(float(p[4]))
+        except (ValueError, IndexError):
+            pass
+    closes = closes[-days:]
+    if not closes:
+        return [], {}
+    return closes, {"name": sym, "currency": "", "price": closes[-1], "source": "Stooq"}
+
+
+def _coingecko_prices(http, sym, days):
+    cid = COINGECKO.get(sym)
+    if not cid:
+        return [], {}
+    r = http.get(f"https://api.coingecko.com/api/v3/coins/{cid}/market_chart", retries=2,
+                 params={"vs_currency": "usd", "days": days, "interval": "daily"})
+    if r is None:
+        http.notes.append(f"CoinGecko: {http.last_error or 'no reply'}")
+        return [], {}
+    try:
+        closes = [p[1] for p in r.json()["prices"] if p[1] is not None][-days:]
+    except Exception:
+        http.notes.append("CoinGecko: unexpected reply")
+        return [], {}
+    if not closes:
+        return [], {}
+    return closes, {"name": cid.title(), "currency": "USD", "price": closes[-1], "source": "CoinGecko"}
+
+
+def get_prices(http, sym, days):
+    closes, meta = _yahoo_prices(http, sym, days)
+    if len(closes) >= 10:
+        return closes, meta
+    for fn in (_stooq_prices, _coingecko_prices):      # backups when Yahoo blocks cloud servers
+        closes, meta = fn(http, sym, days)
+        if len(closes) >= 10:
+            return closes, meta
+    return [], {}
 
 
 def _rss(http, url, tag, sym):
